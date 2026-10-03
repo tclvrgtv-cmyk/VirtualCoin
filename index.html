@@ -479,6 +479,17 @@
   .coin-overflow-item:active{background:rgba(255,255,255,0.08);}
   .coin-overflow-item-danger{color:var(--red);}
   .btn-delete-coin{color:var(--red); background:rgba(255,59,48,0.10); border-color:rgba(255,59,48,0.22);}
+  /* Lampo rosa sulla riga trovata dall'admin: anima solo l'opacità di uno
+     pseudo-elemento, quindi resta sul compositor a piena frequenza. */
+  .coin-row-flash{position:relative;}
+  .coin-row-flash::after{
+    content:""; position:absolute; inset:0; border-radius:inherit; pointer-events:none;
+    box-shadow:inset 0 0 0 2px var(--pink-soft); background:rgba(230,160,191,0.12);
+    animation:coinRowFlash 2.2s ease-out both; will-change:opacity;
+  }
+  @keyframes coinRowFlash{
+    0%{opacity:0;} 12%{opacity:1;} 55%{opacity:1;} 100%{opacity:0;}
+  }
   .btn-with-icon{display:inline-flex; align-items:center; justify-content:center; gap:6px;}
   .btn-with-icon svg{width:15px; height:15px; flex-shrink:0;}
   .icon-btn-sm svg{width:22px; height:22px;}
@@ -3152,6 +3163,7 @@ var qrcode = function() {
 const SUPABASE_URL = "https://uwethdprcasmnlnzeodo.supabase.co";
 const SUPABASE_KEY = "sb_publishable_j5klwLreYU47Qxi6f6QIBw_oFeSdKcf";
 const TABLE = "nfc_coins";
+const ADMIN_DEVICES_TABLE = "admin_devices";
 
 // Wrapper attorno a fetch con timeout: se il server non risponde entro il
 // tempo limite, la richiesta viene interrotta e lancia un errore invece di
@@ -3263,11 +3275,138 @@ async function login(email, password){
   if(!res.ok) throw new Error(data.error_description || data.msg || "Credenziali non valide");
   sessionStorage.setItem("vc_access_token", data.access_token);
   sessionStorage.setItem("vc_refresh_token", data.refresh_token);
+  // Chi entra nel pannello admin da questo telefono lo rende "dispositivo
+  // admin": da quel momento le scansioni NFC aprono la scheda di gestione
+  // invece della vista cliente. Il refresh token persistente evita di dover
+  // rifare il login a ogni moneta passata sotto l'NFC.
+  try{
+    localStorage.setItem("vc_admin_device", "1");
+    localStorage.setItem("vc_admin_refresh", data.refresh_token);
+    localStorage.removeItem("vc_admin_check");
+  }catch(e){ /* localStorage non disponibile: resta la sola sessione corrente */ }
+  // La fonte di verità è Supabase: qui il dispositivo viene registrato nella
+  // tabella admin_devices. Se la chiamata fallisce il login non si blocca:
+  // resta il riconoscimento locale e si riregistra al prossimo accesso.
+  registerAdminDevice().catch(() => {});
+}
+
+function isAdminDevice(){
+  try{ return localStorage.getItem("vc_admin_device") === "1"; }catch(e){ return false; }
+}
+
+function guessDeviceLabel(){
+  const ua = navigator.userAgent;
+  const dev = /iPhone/.test(ua) ? "iPhone" : /iPad/.test(ua) ? "iPad" : /Android/.test(ua) ? "Android"
+            : /Macintosh/.test(ua) ? "Mac" : /Windows/.test(ua) ? "Windows" : "Dispositivo";
+  const br = /CriOS|Chrome/.test(ua) ? "Chrome" : /FxiOS|Firefox/.test(ua) ? "Firefox"
+           : /Safari/.test(ua) ? "Safari" : "Browser";
+  return `${dev} · ${br}`;
+}
+
+// Registra questo dispositivo in admin_devices. Prima un inserimento che
+// ignora i duplicati (così etichetta e stato "attivo" impostati a mano su
+// Supabase non vengono mai sovrascritti da un nuovo login), poi un
+// aggiornamento di "ultimo accesso".
+async function registerAdminDevice(){
+  const id = getDeviceId();
+  const base = `${SUPABASE_URL}/rest/v1/${ADMIN_DEVICES_TABLE}`;
+  await fetchWithTimeout(`${base}?on_conflict=device_id`, {
+    method: "POST",
+    headers: { ...authHeaders(), "Prefer": "resolution=ignore-duplicates,return=minimal" },
+    body: JSON.stringify({ device_id: id, label: guessDeviceLabel(), user_agent: navigator.userAgent.slice(0, 300) }),
+    cache: "no-store"
+  });
+  await touchAdminDevice();
+}
+
+async function touchAdminDevice(){
+  await fetchWithTimeout(`${SUPABASE_URL}/rest/v1/${ADMIN_DEVICES_TABLE}?device_id=eq.${encodeURIComponent(getDeviceId())}`, {
+    method: "PATCH",
+    headers: { ...authHeaders(), "Prefer": "return=minimal" },
+    body: JSON.stringify({ last_seen: new Date().toISOString() }),
+    cache: "no-store"
+  });
+}
+
+// Chiede a Supabase se questo dispositivo è un dispositivo admin attivo.
+// Usa una funzione che risponde solo vero/falso per UN id alla volta: da
+// fuori non si può leggere l'elenco dei dispositivi.
+//  - browser mai visto prima (nessun id salvato) → non può essere registrato,
+//    nessuna chiamata di rete e nessun ritardo per i clienti nuovi;
+//  - risposta "no" ricordata per un'ora, per non rallentare ogni scansione;
+//  - rete assente o funzione non ancora creata → vale l'ultimo stato noto.
+async function checkAdminDevice(){
+  let hasId = false;
+  try{ hasId = !!localStorage.getItem("vc_device_id") || isAdminDevice(); }catch(e){}
+  if(!hasId) return false;
+
+  const flagged = isAdminDevice();
+  if(!flagged){
+    try{
+      const c = JSON.parse(localStorage.getItem("vc_admin_check") || "null");
+      if(c && c.v === false && Date.now() - c.t < 3600000) return false;
+    }catch(e){}
+  }
+  try{
+    const res = await fetchWithTimeout(`${SUPABASE_URL}/rest/v1/rpc/is_admin_device`, {
+      method: "POST",
+      headers: { "apikey": SUPABASE_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ p_device_id: getDeviceId() }),
+      cache: "no-store"
+    }, 3000);
+    if(!res.ok) throw new Error("check non disponibile");
+    const isAdmin = (await res.json()) === true;
+    try{
+      if(isAdmin){
+        localStorage.setItem("vc_admin_device", "1");
+        localStorage.removeItem("vc_admin_check");
+      }else{
+        // Disattivato o rimosso su Supabase: il telefono torna cliente.
+        localStorage.removeItem("vc_admin_device");
+        localStorage.removeItem("vc_admin_refresh");
+        localStorage.setItem("vc_admin_check", JSON.stringify({ v: false, t: Date.now() }));
+      }
+    }catch(e){}
+    return isAdmin;
+  }catch(e){
+    return flagged;
+  }
+}
+
+// Ripristina la sessione admin da un refresh token salvato (nuova scheda,
+// browser riaperto, scansione NFC). Supabase ruota il refresh token a ogni
+// uso, quindi va salvato quello nuovo restituito dalla risposta.
+async function restoreAdminSession(){
+  if(isLoggedIn()) return true;
+  let rt = null;
+  try{ rt = localStorage.getItem("vc_admin_refresh"); }catch(e){}
+  if(!rt) return false;
+  try{
+    const res = await fetchWithTimeout(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+      method: "POST",
+      headers: { "apikey": SUPABASE_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: rt }),
+      cache: "no-store"
+    });
+    const data = await res.json();
+    if(!res.ok || !data.access_token) throw new Error("refresh non valido");
+    sessionStorage.setItem("vc_access_token", data.access_token);
+    sessionStorage.setItem("vc_refresh_token", data.refresh_token);
+    try{ localStorage.setItem("vc_admin_refresh", data.refresh_token); }catch(e){}
+    return true;
+  }catch(e){
+    // Sessione scaduta o revocata: si dovrà rifare il login a mano.
+    try{ localStorage.removeItem("vc_admin_refresh"); }catch(_){}
+    return false;
+  }
 }
 
 function logout(){
   sessionStorage.removeItem("vc_access_token");
   sessionStorage.removeItem("vc_refresh_token");
+  // L'uscita chiude davvero la sessione; il telefono resta però
+  // riconosciuto come dispositivo admin (basta rifare il login).
+  try{ localStorage.removeItem("vc_admin_refresh"); }catch(e){}
   goHome();
 }
 
@@ -3924,37 +4063,45 @@ function renderActiveCard(coin, expiry, animated){
   };
 }
 
+function renderAdminLogin(onSuccess, subtitle){
+  app.innerHTML = `
+    <div class="card-enter">
+    <p class="brand-title">VIRTUAL COIN</p>
+    <div class="card">
+      <h1>Accesso admin</h1>
+      ${subtitle ? `<p class="status-sub" style="margin:-4px 0 16px">${subtitle}</p>` : ""}
+      <label class="field-label">Email</label>
+      <input type="text" id="loginUser" autocomplete="username">
+      <label class="field-label">Password</label>
+      <input type="password" id="loginPass" autocomplete="current-password">
+      <button class="btn btn-primary" id="loginBtn">Accedi</button>
+      <div class="error-text hidden" id="loginError"></div>
+    </div>
+    </div>`;
+  document.getElementById("loginBtn").onclick = async () => {
+    const user = document.getElementById("loginUser").value.trim();
+    const pass = document.getElementById("loginPass").value;
+    const errEl = document.getElementById("loginError");
+    const btn = document.getElementById("loginBtn");
+    errEl.classList.add("hidden");
+    btn.textContent = "Accesso in corso…";
+    try{
+      await login(user, pass);
+      onSuccess();
+    }catch(e){
+      btn.textContent = "Accedi";
+      errEl.textContent = e.message;
+      errEl.classList.remove("hidden");
+    }
+  };
+}
+
+// Moneta da mettere in evidenza nell'elenco dopo "Trova nel pannello".
+let adminFocusCoinId = null;
+
 function renderAdmin(){
   if(!isLoggedIn()){
-    app.innerHTML = `
-      <div class="card-enter">
-      <p class="brand-title">VIRTUAL COIN</p>
-      <div class="card">
-        <h1>Accesso admin</h1>
-        <label class="field-label">Email</label>
-        <input type="text" id="loginUser" autocomplete="username">
-        <label class="field-label">Password</label>
-        <input type="password" id="loginPass" autocomplete="current-password">
-        <button class="btn btn-primary" id="loginBtn">Accedi</button>
-        <div class="error-text hidden" id="loginError"></div>
-      </div>
-      </div>`;
-    document.getElementById("loginBtn").onclick = async () => {
-      const user = document.getElementById("loginUser").value.trim();
-      const pass = document.getElementById("loginPass").value;
-      const errEl = document.getElementById("loginError");
-      const btn = document.getElementById("loginBtn");
-      errEl.classList.add("hidden");
-      btn.textContent = "Accesso in corso…";
-      try{
-        await login(user, pass);
-        renderAdmin();
-      }catch(e){
-        btn.textContent = "Accedi";
-        errEl.textContent = e.message;
-        errEl.classList.remove("hidden");
-      }
-    };
+    renderAdminLogin(renderAdmin);
     return;
   }
 
@@ -4792,6 +4939,31 @@ async function loadCoinList(){
   }
 
   renderFilteredCoinList();
+  if(adminFocusCoinId){
+    const focusId = adminFocusCoinId;
+    adminFocusCoinId = null;
+    focusCoinRow(focusId);
+  }
+}
+
+// Porta la riga della moneta al centro dello schermo (aprendola se la lista
+// è in modalità elenco) e le dà un breve lampo rosa per farla riconoscere.
+function focusCoinRow(id){
+  const row = document.getElementById(`row-${cssId(id)}`);
+  if(!row) return;
+  const list = document.getElementById("coinList");
+  if(list && list.classList.contains("coin-list-as-list")){
+    const details = row.querySelector(".coin-row-details");
+    if(details) details.style.setProperty("--details-h", details.scrollHeight + "px");
+    row.classList.add("expanded");
+  }
+  setTimeout(() => {
+    row.scrollIntoView({ behavior: "smooth", block: "center" });
+    row.classList.remove("coin-row-flash");
+    void row.offsetWidth;
+    row.classList.add("coin-row-flash");
+    setTimeout(() => row.classList.remove("coin-row-flash"), 2300);
+  }, 140);
 }
 
 // Applica ricerca testuale + filtro di stato alla cache locale delle coin,
@@ -5071,12 +5243,13 @@ function showGeneratedLinkPopup(code){
   document.getElementById("closeLinkPopup").onclick = () => closeModal(overlay);
 }
 
-function handleReset(coin){
+function handleReset(coin, onDone){
   const currentCode = coin.session_code || fakeDisplayCode(coin.id);
   const doReset = async () => {
     const newSessionCode = await generateUniqueSessionCode();
     await sbUpdateCoin(coin.id, { first_scan_at: null, expires_at: null, duration_value: null, duration_unit: null, session_code: newSessionCode, device_id: null });
     loadCoinList();
+    if(onDone) onDone();
   };
   confirmAction(`Reset di "${currentCode}"? Tornerà riutilizzabile da zero con un nuovo codice.`, doReset);
 }
@@ -5130,11 +5303,12 @@ function showManualActivationPopup(coin){
   document.getElementById("closeManualActivationPopup").onclick = () => closeModal(overlay);
 }
 
-function handleUnlockDevice(coin){
+function handleUnlockDevice(coin, onDone){
   const currentCode = coin.session_code || fakeDisplayCode(coin.id);
   confirmAction(`Cambiare dispositivo per "${currentCode}"? Il prossimo telefono che apre il link ne diventerà il proprietario.`, async () => {
     await sbUpdateCoin(coin.id, { device_id: null });
     loadCoinList();
+    if(onDone) onDone();
   });
 }
 
@@ -5189,21 +5363,116 @@ function confirmActionTyped(message, expectedCode, onConfirm){
   };
 }
 
+// Scheda di gestione mostrata quando un DISPOSITIVO ADMIN passa una moneta
+// sotto l'NFC: la moneta viene riconosciuta senza agganciarla al telefono
+// (niente "Attiva" lato cliente), e si può resettarla o trovarla nell'elenco.
+async function renderAdminCoinScan(coinId){
+  if(!isLoggedIn()){
+    const ok = await restoreAdminSession();
+    if(!ok){
+      renderAdminLogin(() => renderAdminCoinScan(coinId), "Accedi per gestire questa VirtualCoin.");
+      return;
+    }
+  }
+  app.innerHTML = `<div class="card coin-status card-enter"><p class="status-sub" style="margin:0">Caricamento…</p></div>`;
+
+  let coin;
+  try{
+    coin = await sbSelectCoin(coinId);
+  }catch(e){
+    app.innerHTML = `
+      <div class="card coin-status card-enter">
+        <p class="status-sub" style="margin:0 0 6px">Modalità admin</p>
+        <p class="status-title">Errore di lettura</p>
+        <p class="status-sub" style="margin-bottom:18px">Controlla la connessione e riprova.</p>
+        <button class="btn btn-primary" id="scanRetryBtn">Riprova</button>
+      </div>`;
+    document.getElementById("scanRetryBtn").onclick = () => renderAdminCoinScan(coinId);
+    return;
+  }
+
+  touchAdminDevice().catch(() => {});
+
+  const goPanel = (focusId) => {
+    adminFocusCoinId = focusId || null;
+    history.replaceState(null, "", window.location.pathname + "?admin");
+    renderAdmin();
+  };
+
+  if(!coin){
+    app.innerHTML = `
+      <div class="card coin-status card-enter">
+        <p class="status-sub" style="margin:0 0 6px">Modalità admin</p>
+        <p class="status-title">Moneta non registrata</p>
+        <p class="status-sub" style="margin-bottom:18px">Questo codice non è presente nel sistema.</p>
+        <button class="btn btn-primary" id="scanPanelBtn">Apri il pannello</button>
+      </div>`;
+    document.getElementById("scanPanelBtn").onclick = () => goPanel(null);
+    return;
+  }
+
+  const expiry = effectiveExpiry(coin);
+  const code = coin.session_code || fakeDisplayCode(coin.id);
+  const canReset = !!(coin.first_scan_at || coin.device_id);
+  app.innerHTML = `
+    <div class="card coin-status card-enter">
+      <p class="status-sub" style="margin:0 0 6px">Modalità admin · moneta riconosciuta</p>
+      <p class="status-title">${code}</p>
+      ${coin.label ? `<p class="status-sub" style="margin:0 0 10px">${coin.label}</p>` : ""}
+      <div style="margin:6px 0 16px">${statusBadge(coin)}</div>
+      <p class="note-text" style="margin-bottom:22px">
+        Attivata il: ${fmtDate(coin.first_scan_at)}<br>
+        Scade il: ${expiry ? fmtDate(expiry.toISOString()) : "—"} · Durata: <strong>${derivedDurationLabel(coin)}</strong>
+      </p>
+      <button class="btn btn-primary" id="scanPanelBtn">Trova nel pannello</button>
+      ${canReset ? `<button class="btn btn-secondary btn-with-icon" id="scanResetBtn" style="margin-top:10px">${icons.reset}Reset</button>` : ""}
+      ${coin.device_id ? `<button class="btn btn-secondary" id="scanUnlockBtn" style="margin-top:10px">Cambio dispositivo</button>` : ""}
+    </div>`;
+  document.getElementById("scanPanelBtn").onclick = () => goPanel(coin.id);
+  const resetBtn = document.getElementById("scanResetBtn");
+  if(resetBtn) resetBtn.onclick = () => handleReset(coin, () => renderAdminCoinScan(coin.id));
+  const unlockBtn = document.getElementById("scanUnlockBtn");
+  if(unlockBtn) unlockBtn.onclick = () => handleUnlockDevice(coin, () => renderAdminCoinScan(coin.id));
+}
+
+// Apre il pannello ripristinando prima, se possibile, la sessione salvata.
+function openAdminPanel(){
+  let hasSaved = false;
+  try{ hasSaved = !!localStorage.getItem("vc_admin_refresh"); }catch(e){}
+  if(!isLoggedIn() && hasSaved){
+    restoreAdminSession().finally(renderAdmin);
+  }else{
+    renderAdmin();
+  }
+}
+
 (function init(){
   setupPullToRefresh();
   const params = new URLSearchParams(window.location.search);
   if(params.has("admin")){
-    renderAdmin();
+    openAdminPanel();
   }else if(params.has("c")){
     const coinId = params.get("c");
-    sessionStorage.setItem("vc_active_coin", coinId);
-    renderCoinView(coinId);
+    // Dispositivo admin → scheda di gestione. Per provare la vista cliente
+    // da un telefono admin basta aggiungere &client=1 al link.
+    const startClient = () => {
+      sessionStorage.setItem("vc_active_coin", coinId);
+      renderCoinView(coinId);
+    };
+    if(params.has("client")){
+      startClient();
+    }else{
+      // Il controllo avviene PRIMA di mostrare qualunque cosa: la vista
+      // cliente aggancia la moneta al telefono, quindi un admin non deve
+      // nemmeno passarci.
+      checkAdminDevice().then(isAdmin => isAdmin ? renderAdminCoinScan(coinId) : startClient());
+    }
   }else{
     const rememberedCoin = sessionStorage.getItem("vc_active_coin");
     if(rememberedCoin){
       renderCoinView(rememberedCoin);
     }else{
-      renderAdmin();
+      openAdminPanel();
     }
   }
 })();
